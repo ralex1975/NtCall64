@@ -1,12 +1,12 @@
 /*******************************************************************************
 *
-*  (C) COPYRIGHT AUTHORS, 2016
+*  (C) COPYRIGHT AUTHORS, 2016 - 2018
 *
 *  TITLE:       FUZZWIN32K.C
 *
-*  VERSION:     1.00
+*  VERSION:     1.25
 *
-*  DATE:        11 July 2016
+*  DATE:        04 Dec 2018
 *
 *  Shadow table fuzzing routines.
 *
@@ -21,11 +21,9 @@
 #include "fuzzwin32k.h"
 #include "tables.h"
 
-#define WIN32K_CFG_FILE "win32k_cfg.ini"
-
 CHAR **g_lpWin32pServiceTableNames = NULL;
 
-BADCALLS g_Win32kSyscallBlacklist;
+BLACKLIST g_W32kBlackList;
 
 /*
 * find_w32pservicetable
@@ -73,7 +71,7 @@ DWORD WINAPI win32k_callproc(
     ULONG  r;
     CALL_PARAM *CallParam = (PCALL_PARAM)Parameter;
 
-    for (r = 0; r < 256 * 1024; r++) {
+    for (r = 0; r < 64 * 1024; r++) {
         gofuzz(CallParam->Syscall, CallParam->ParametersInStack);
     }
 
@@ -104,7 +102,12 @@ BOOL lookup_win32k_names(
     PCHAR     pfn;
     IMAGE_IMPORT_BY_NAME *ImportEntry;
 
-    GetWin32kBuildVersion(ModuleName, &BuildNumber);
+    hde64s hs;
+
+    if (!GetImageVersionInfo(ModuleName, NULL, NULL, &BuildNumber, NULL)) {
+        OutputConsoleMessage("\r\nFailed to query win32k.sys version information.\r\n");
+        return FALSE;
+    }
 
     switch (BuildNumber) {
 
@@ -131,15 +134,32 @@ BOOL lookup_win32k_names(
         break;
     }
 
-    g_lpWin32pServiceTableNames = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ServiceTable->CountOfEntries * sizeof(PVOID));
+    g_lpWin32pServiceTableNames = (CHAR**)HeapAlloc(GetProcessHeap(),
+        HEAP_ZERO_MEMORY,
+        ServiceTable->CountOfEntries * sizeof(PVOID));
+
     if (g_lpWin32pServiceTableNames == NULL)
         return FALSE;
 
     pW32pServiceTable = (DWORD64*)ServiceTable->ServiceTable;
 
-    for (i = 0; i < ServiceTable->CountOfEntries; i++) {
+    //
+    // Query service names.
+    // If win32k version below 10240 copy them from predefined array.
+    // Otherwise lookup them dynamically from win32k import.
+    //
+    if (BuildNumber < 10240) {
+        if (Names == NULL)
+            return FALSE;
 
-        if (BuildNumber > 9600) {
+        for (i = 0; i < ServiceTable->CountOfEntries; i++) {
+            g_lpWin32pServiceTableNames[i] = Names[i];
+        }
+    }
+    else {
+
+        for (i = 0; i < ServiceTable->CountOfEntries; i++) {
+
             if (BuildNumber > 10586) {
                 Table = (DWORD *)pW32pServiceTable;
                 pfn = (PCHAR)(Table[i] + MappedImageBase);
@@ -147,14 +167,19 @@ BOOL lookup_win32k_names(
             else {
                 pfn = (PCHAR)(pW32pServiceTable[i] - NtHeaders->OptionalHeader.ImageBase + MappedImageBase);
             }
-            Address = MappedImageBase + *(ULONG_PTR*)(pfn + 6 + *(DWORD*)(pfn + 2));
+
+            hde64_disasm((void*)pfn, &hs);
+            if (hs.flags & F_ERROR) {
+                OutputConsoleMessage("\r\nlookup_win32k_names hde error.\r\n");
+                break;
+            }
+
+            Address = MappedImageBase + *(ULONG_PTR*)(pfn + hs.len + *(DWORD*)(pfn + (hs.len - 4)));
             if (Address) {
                 ImportEntry = (IMAGE_IMPORT_BY_NAME *)Address;
                 g_lpWin32pServiceTableNames[i] = ImportEntry->Name;
             }
-        }
-        else {
-            g_lpWin32pServiceTableNames[i] = Names[i];
+
         }
     }
     return TRUE;
@@ -170,34 +195,34 @@ BOOL lookup_win32k_names(
 */
 void fuzz_win32k()
 {
-    BOOL        bSkip = FALSE;
+    BOOL        bSkip = FALSE, bCond = FALSE;
     ULONG       r, c;
+    HMODULE     hUser32 = 0;
     ULONG_PTR   KernelImage = 0;
     HANDLE      hCallThread = NULL;
     CALL_PARAM  CallParam;
     CHAR       *Name;
     CHAR        textbuf[1024];
 
-    HWND        hWnd;
-
     RAW_SERVICE_TABLE	ServiceTable;
     WCHAR               szBuffer[MAX_PATH * 2];
 
-    RtlSecureZeroMemory(szBuffer, sizeof(szBuffer));
-    if (GetSystemDirectory(szBuffer, MAX_PATH)) {
+    do {
+        hUser32 = LoadLibrary(TEXT("user32.dll"));
+        if (hUser32 == 0)
+            break;
+
+        RtlSecureZeroMemory(szBuffer, sizeof(szBuffer));
+        if (!GetSystemDirectory(szBuffer, MAX_PATH))
+            break;
+
         _strcat(szBuffer, TEXT("\\win32k.sys"));
-    }
+        KernelImage = (ULONG_PTR)LoadLibraryEx(szBuffer, NULL, 0);
+        if (KernelImage == 0)
+            break;
 
-    hWnd = FindWindowW(L"Shell_TrayWnd", L"");
-    if (hWnd != NULL) {
-        SendMessage(hWnd, WM_PAINT, 0, 0);
-    }
-
-    RtlSecureZeroMemory(&g_Win32kSyscallBlacklist, sizeof(g_Win32kSyscallBlacklist));
-    ReadBlacklistCfg(&g_Win32kSyscallBlacklist, CFG_FILE, "win32k");
-
-    KernelImage = (ULONG_PTR)LoadLibraryEx(szBuffer, NULL, 0);
-    while (KernelImage != 0) {
+        RtlSecureZeroMemory(&g_W32kBlackList, sizeof(g_W32kBlackList));
+        BlackListCreateFromFile(&g_W32kBlackList, CFG_FILE, (LPCSTR)"win32k");
 
         if (!find_w32pservicetable((HMODULE)KernelImage, &ServiceTable))
             break;
@@ -205,7 +230,7 @@ void fuzz_win32k()
         if (!lookup_win32k_names(szBuffer, KernelImage, &ServiceTable))
             break;
 
-        force_priv();
+        ForcePrivilegeEnabled();
 
         for (c = 0; c < ServiceTable.CountOfEntries; c++) {
 
@@ -218,36 +243,46 @@ void fuzz_win32k()
             ultostr_a(ServiceTable.StackArgumentTable[c] / 4, _strend_a(textbuf));
 
             _strcat_a(textbuf, "\tname:");
-            if (Name != NULL)
+            if (Name != NULL) {
                 _strcat_a(textbuf, Name);
-            else
-                _strcat_a(textbuf, "#noname#");
 
-            bSkip = SyscallBlacklisted(Name, &g_Win32kSyscallBlacklist);
-            if (bSkip) {
-                _strcat_a(textbuf, " - skip, blacklist");
+                bSkip = BlackListEntryPresent(&g_W32kBlackList, (LPCSTR)Name);
+                if (bSkip) {
+                    _strcat_a(textbuf, " ******* found in blacklist, skip");
+                }
+
+            }
+            else {
+                _strcat_a(textbuf, "#noname#");
             }
 
             _strcat_a(textbuf, "\r\n");
-            WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), textbuf, (DWORD)_strlen_a(textbuf), &r, NULL);
+            OutputConsoleMessage(textbuf);
 
-            if (bSkip)
+            if (bSkip) {
+                bSkip = FALSE;
                 continue;
+            }
 
             CallParam.ParametersInStack = ServiceTable.StackArgumentTable[c];
             CallParam.Syscall = c + W32SYSCALLSTART;
             hCallThread = CreateThread(NULL, 0, win32k_callproc, (LPVOID)&CallParam, 0, &r);
             if (hCallThread) {
-                if (WaitForSingleObject(hCallThread, 10 * 1000) == WAIT_TIMEOUT) {
+                if (WaitForSingleObject(hCallThread, 20 * 1000) == WAIT_TIMEOUT) {
                     _strcpy_a(textbuf, "Timeout reached for callproc of Service: ");
                     ultostr_a(CallParam.Syscall, _strend_a(textbuf));
                     _strcat_a(textbuf, "\r\n");
-                    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), textbuf, (DWORD)_strlen_a(textbuf), &r, NULL);
+                    OutputConsoleMessage(textbuf);
                     TerminateThread(hCallThread, (DWORD)-1);
                 }
                 CloseHandle(hCallThread);
             }
         }
-        break;
-    }
+
+    } while (bCond);
+
+    if (KernelImage != 0) FreeLibrary((HMODULE)KernelImage);
+    if (hUser32 != 0) FreeLibrary(hUser32);
+
+    OutputConsoleMessage("Win32k services fuzzing complete.\r\n");
 }

@@ -1,12 +1,12 @@
 /*******************************************************************************
 *
-*  (C) COPYRIGHT AUTHORS, 2016
+*  (C) COPYRIGHT AUTHORS, 2016 - 2018
 *
 *  TITLE:       UTIL.C
 *
-*  VERSION:     1.00
+*  VERSION:     1.25
 *
-*  DATE:        11 July 2016
+*  DATE:        04 Dec 2018
 *
 *  Program support routines.
 *
@@ -20,15 +20,36 @@
 
 #pragma comment(lib, "Version.lib")
 
+VOID FORCEINLINE InitializeListHead(
+    _In_ PLIST_ENTRY ListHead
+)
+{
+    ListHead->Flink = ListHead->Blink = ListHead;
+}
+
+VOID FORCEINLINE InsertTailList(
+    _Inout_ PLIST_ENTRY ListHead,
+    _Inout_ PLIST_ENTRY Entry
+)
+{
+    PLIST_ENTRY Blink;
+
+    Blink = ListHead->Blink;
+    Entry->Flink = ListHead;
+    Entry->Blink = Blink;
+    Blink->Flink = Entry;
+    ListHead->Blink = Entry;
+}
+
 /*
-* force_priv
+* ForcePrivilegeEnabled
 *
 * Purpose:
 *
 * Attempt to enable all known privileges.
 *
 */
-void force_priv()
+void ForcePrivilegeEnabled()
 {
     ULONG c;
     BOOLEAN bWasEnabled;
@@ -97,153 +118,229 @@ void log_call(
 }
 
 /*
-* GetWin32kBuildVersion
+* GetImageVersionInfo
 *
 * Purpose:
 *
-* Return build number of Win32k.
+* Return version numbers from version info.
 *
 */
-BOOL GetWin32kBuildVersion(
-    LPWSTR szImagePath,
-    ULONG *BuildNumber
+_Success_(return != FALSE)
+BOOL GetImageVersionInfo(
+    _In_ LPWSTR lpFileName,
+    _Out_opt_ ULONG *MajorVersion,
+    _Out_opt_ ULONG *MinorVersion,
+    _Out_opt_ ULONG *Build,
+    _Out_opt_ ULONG *Revision
 )
 {
-    BOOL bCond = FALSE, bResult = FALSE;
+    BOOL bResult = FALSE;
     DWORD dwHandle, dwSize;
     PVOID vinfo = NULL;
     UINT Length;
     VS_FIXEDFILEINFO *pFileInfo;
 
-    do {
-
-        if (BuildNumber == NULL)
-            break;
-
-        dwHandle = 0;
-        dwSize = GetFileVersionInfoSizeW(szImagePath, &dwHandle);
-        if (dwSize == 0) {
-            break;
-        }
-
+    dwHandle = 0;
+    dwSize = GetFileVersionInfoSize(lpFileName, &dwHandle);
+    if (dwSize) {
         vinfo = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwSize);
-        if (vinfo == NULL) {
-            break;
+        if (vinfo) {
+            if (GetFileVersionInfo(lpFileName, 0, dwSize, vinfo)) {
+                bResult = VerQueryValue(vinfo, TEXT("\\"), (LPVOID *)&pFileInfo, (PUINT)&Length);
+                if (bResult) {
+                    if (MajorVersion)
+                        *MajorVersion = HIWORD(pFileInfo->dwFileVersionMS);
+                    if (MinorVersion)
+                        *MinorVersion = LOWORD(pFileInfo->dwFileVersionMS);
+                    if (Build)
+                        *Build = HIWORD(pFileInfo->dwFileVersionLS);
+                    if (Revision)
+                        *Revision = LOWORD(pFileInfo->dwFileVersionLS);
+                }
+            }
+            HeapFree(GetProcessHeap(), 0, vinfo);
         }
-
-        if (!GetFileVersionInfo(szImagePath, 0, dwSize, vinfo)) {
-            break;
-        }
-
-        bResult = VerQueryValueW(vinfo, L"\\", (LPVOID *)&pFileInfo, (PUINT)&Length);
-        if (bResult) {
-            *BuildNumber = HIWORD(pFileInfo->dwFileVersionLS);
-        }
-
-    } while (bCond);
-
-    if (vinfo) {
-        HeapFree(GetProcessHeap(), 0, vinfo);
     }
-
     return bResult;
 }
 
 /*
-* ReadBlacklistCfg
+* OutputConsoleMessage
 *
 * Purpose:
 *
-* Read blacklist from ini file.
+* Output text to screen.
 *
 */
-BOOL ReadBlacklistCfg(
-    BADCALLS *Cfg,
-    LPSTR CfgFileName,
-    LPSTR CfgSection
+VOID OutputConsoleMessage(
+    _In_ LPCSTR lpMessage)
+{
+    ULONG r;
+
+    WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), 
+        lpMessage, 
+        (DWORD)_strlen_a(lpMessage), 
+        &r, 
+        NULL);
+}
+
+/*
+* BlackListCreateFromFile
+*
+* Purpose:
+*
+* Read blacklist from ini file to allocated memory.
+*
+*/
+BOOL BlackListCreateFromFile(
+    _In_ BLACKLIST *BlackList,
+    _In_ LPCSTR ConfigFileName,
+    _In_ LPCSTR ConfigSectionName
 )
 {
     BOOL    bCond = FALSE, bResult = FALSE;
-    LPSTR   Section = NULL, ptr = NULL;
-    PCHAR  *Syscalls;
-    ULONG   nSize = 16 * 1024, i, c;
+    LPSTR   Section = NULL, SectionPtr;
+    ULONG   nSize, SectionSize, BytesRead, Length;
     CHAR    ConfigFilePath[MAX_PATH + 16];
 
-    do {
+    HANDLE BlackListHeap;
 
-        if ((Cfg == NULL) || (CfgFileName == NULL) || (CfgSection == NULL))
-            break;
+    PBL_ENTRY Entry = NULL;
+
+    do {
 
         RtlSecureZeroMemory(ConfigFilePath, sizeof(ConfigFilePath));
         GetModuleFileNameA(NULL, (LPSTR)&ConfigFilePath, MAX_PATH);
         _filepath_a(ConfigFilePath, ConfigFilePath);
-        _strcat_a(ConfigFilePath, CfgFileName);
+        _strcat_a(ConfigFilePath, ConfigFileName);
 
-        Section = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, nSize);
+        BlackListHeap = HeapCreate(HEAP_GROWABLE, 0, 0);
+        if (BlackListHeap == NULL)
+            break;
+
+        HeapSetInformation(BlackListHeap, HeapEnableTerminationOnCorruption, NULL, 0);
+
+        nSize = 2 * (1024 * 1024);
+
+        Section = (LPSTR)HeapAlloc(BlackListHeap, HEAP_ZERO_MEMORY, nSize);
         if (Section == NULL)
             break;
 
-        if (!GetPrivateProfileSectionA(CfgSection, Section, nSize, ConfigFilePath))
+        SectionSize = GetPrivateProfileSectionA(ConfigSectionName, Section, nSize, ConfigFilePath);
+        if (SectionSize == 0)
             break;
 
-        ptr = Section;
+        BytesRead = 0;
+        SectionPtr = Section;
 
-        c = 0;
+        RtlSecureZeroMemory(BlackList, sizeof(BLACKLIST));
+
+        InitializeListHead(&BlackList->ListHead);
 
         do {
-            if (*ptr == 0)
+
+            if (*SectionPtr == 0)
                 break;
-            ptr += _strlen_a(ptr) + 1;
-            c += 1;
-        } while (1);
 
-        Syscalls = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PVOID) * c);
-        if (Syscalls == NULL)
-            break;
+            Length = (ULONG)_strlen_a(SectionPtr) + 1;
+            BytesRead += Length;
 
-        i = 0;
-        ptr = Section;
-        do {
-            if (*ptr == 0)
-                break;
-            Syscalls[i] = ptr;
-            ptr += _strlen_a(ptr) + 1;
-            i++;
-        } while (1);
+            Entry = (BL_ENTRY*)HeapAlloc(BlackListHeap, HEAP_ZERO_MEMORY, sizeof(BL_ENTRY));
+            if (Entry == NULL) {
+                goto Cleanup;
+            }
 
-        Cfg->Count = c;
-        Cfg->Syscalls = Syscalls;
+            Entry->Hash = BlackListHashString(SectionPtr);
+
+            InsertTailList(&BlackList->ListHead, &Entry->ListEntry);
+
+            BlackList->NumberOfEntries += 1;
+
+            SectionPtr += Length;
+
+        } while (BytesRead < SectionSize);
+
+        BlackList->HeapHandle = BlackListHeap;
 
         bResult = TRUE;
 
     } while (bCond);
 
+Cleanup:
+
+    if (bResult == FALSE) {
+        if (BlackListHeap) HeapDestroy(BlackListHeap);
+    }
     return bResult;
 }
 
 /*
-* SyscallBlacklisted
+* BlackListEntryPresent
 *
 * Purpose:
 *
 * Return TRUE if syscall is in blacklist.
 *
 */
-BOOL SyscallBlacklisted(
-    LPSTR Syscall,
-    BADCALLS *Cfg
+BOOL BlackListEntryPresent(
+    _In_ BLACKLIST *BlackList,
+    _In_ LPCSTR SyscallName
 )
 {
-    ULONG  i, c;
+    DWORD Hash = BlackListHashString(SyscallName);
 
-    if ((Cfg == NULL) || (Syscall == NULL))
-        return FALSE;
+    PLIST_ENTRY Head, Next;
+    BL_ENTRY *entry;
 
-    c = Cfg->Count;
-
-    for (i = 0; i < c; i++) {
-        if (_strcmp_a(Syscall, Cfg->Syscalls[i]) == 0)
+    Head = &BlackList->ListHead;
+    Next = Head->Flink;
+    while ((Next != NULL) && (Next != Head)) {
+        entry = CONTAINING_RECORD(Next, BL_ENTRY, ListEntry);
+        if (entry->Hash == Hash)
             return TRUE;
+
+        Next = Next->Flink;
     }
+
     return FALSE;
 }
+
+/*
+* BlackListHashString
+*
+* Purpose:
+*
+* Hash string.
+*
+*/
+DWORD BlackListHashString(
+    _In_ LPCSTR Name
+)
+{
+    DWORD Hash = 5381;
+    PCHAR p = (PCHAR)Name;
+
+    while (*p)
+        Hash = 33 * Hash ^ *p++;
+
+    return Hash;
+}
+
+/*
+* BlackListDestroy
+*
+* Purpose:
+*
+* Destroy blacklist heap and zero blacklist structure.
+*
+*/
+VOID BlackListDestroy(
+    _In_ BLACKLIST *BlackList
+)
+{
+    if (BlackList) {
+        if (BlackList->HeapHandle) HeapDestroy(BlackList->HeapHandle);
+        RtlSecureZeroMemory(BlackList, sizeof(BLACKLIST));
+    }
+}
+

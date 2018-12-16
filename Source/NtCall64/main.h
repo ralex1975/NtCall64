@@ -1,12 +1,12 @@
 /*******************************************************************************
 *
-*  (C) COPYRIGHT AUTHORS, 2016
+*  (C) COPYRIGHT AUTHORS, 2016 - 2018
 *
 *  TITLE:       MAIN.H
 *
-*  VERSION:     1.00
+*  VERSION:     1.25
 *
-*  DATE:        11 July 2016
+*  DATE:        04 Dec 2018
 *
 *  Global definitions.
 *
@@ -22,24 +22,23 @@
 #error ANSI build is not supported
 #endif
 
-#if (_MSC_VER >= 1900) 
+#if defined (_MSC_VER)
+#if (_MSC_VER >= 1910)
 #ifdef _DEBUG
 #pragma comment(lib, "vcruntimed.lib")
 #pragma comment(lib, "ucrtd.lib")
 #else
+#pragma comment(lib, "libucrt.lib")
 #pragma comment(lib, "libvcruntime.lib")
 #endif
 #endif
+#endif
 
-#pragma warning(disable: 28278) // Function name appears with no prototype in scope
 #pragma warning(disable: 4005)  // macro redefinition
-#pragma warning(disable: 4054)  // from function pointer to data pointer
-#pragma warning(disable: 4055)  // from data pointer to function pointer
 #pragma warning(disable: 4091)  // 'typedef ': ignored on left of '' when no variable is declared
-#pragma warning(disable: 4152)  // nonstandard extension, function/data pointer conversion in expression
 #pragma warning(disable: 4201)  // nonstandard extension used : nameless struct/union
-#pragma warning(disable: 6102)  // Using %s from failed function call at line %u
 #pragma warning(disable: 6320)  // exception-filter expression is the constant EXCEPTION_EXECUTE_HANDLER
+#pragma warning(disable: 28278) // Function name appears with no prototype in scope
 
 #include <windows.h>
 #include <ntstatus.h>
@@ -47,10 +46,9 @@
 #include "minirtl\_filename.h"
 #include "minirtl\cmdline.h"
 #include "ntos.h"
+#include "hde\hde64.h"
 #include "util.h"
 #include "fuzz.h"
-
-#define CFG_FILE       "badcalls.ini"
 
 void gofuzz(
     ULONG ServiceIndex, 
